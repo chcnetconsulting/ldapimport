@@ -74,12 +74,6 @@ except ImportError:
     sys.exit("ldap3 not installed — run: pip install ldap3")
 
 try:
-    from argon2 import PasswordHasher
-    ARGON2 = True
-except ImportError:
-    ARGON2 = False  # only required when --reset-rejected-passwords is used
-
-try:
     from rich import box
     from rich.console import Console
     from rich.table import Table
@@ -104,13 +98,6 @@ except ImportError:
 # Matches DEFAULT_PASSWORD in ldap_to_sqlite.py, so a round-trip "ppolicy
 # absent → ppolicy present" import lands on the same plaintext.
 DEFAULT_RESET_PASSWORD = "Changeme12345!"
-
-
-def argon2_ldap_hash(password: str) -> str:
-    """Return {ARGON2}<hash> in the form OpenLDAP's pw-argon2 module accepts."""
-    if not ARGON2:
-        sys.exit("argon2-cffi not installed — run: pip install argon2-cffi")
-    return f"{{ARGON2}}{PasswordHasher().hash(password)}"
 
 
 # ── attribute mapping: SQLite column → LDAP attribute name ──────────────────
@@ -228,8 +215,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "When the target ppolicy rejects a userPassword (constraintViolation),"
-            " retry the operation with a strong Argon2-hashed default. Requires the"
-            " OpenLDAP pw-argon2 module on the target server."
+            " retry with the plaintext default password so the server can run its"
+            " own quality checks and hash it under olcPasswordHash."
         ),
     )
     p.add_argument(
@@ -520,16 +507,18 @@ def import_user(
     update: bool,
     skip_existing: bool,
     dry_run: bool,
-    reset_password_hash: Optional[str] = None,
+    reset_password: Optional[str] = None,
 ) -> tuple[str, str]:
     """
     Add (or update) one user entry.
     Returns (status, detail) where
     status ∈ {added, updated, reset, skipped, error, dry-run}.
 
-    When reset_password_hash is set and the server rejects userPassword with a
-    constraint violation, the operation is retried once with that hash
-    substituted for the original userPassword.
+    When reset_password is set and the server rejects userPassword with a
+    constraint violation, the operation is retried once with that plaintext
+    substituted for userPassword. Sending plaintext lets ppolicy run its own
+    quality checks (it rejects pre-hashed values outright under
+    pwdCheckQuality=2) and lets the server hash it via olcPasswordHash.
     """
     if dry_run:
         exists = False
@@ -551,9 +540,9 @@ def import_user(
     except LDAPEntryAlreadyExistsResult:
         pass
     except LDAPConstraintViolationResult as e:
-        if reset_password_hash and "userPassword" in attrs:
+        if reset_password and "userPassword" in attrs:
             retry = dict(attrs)
-            retry["userPassword"] = reset_password_hash
+            retry["userPassword"] = reset_password
             try:
                 conn.add(dn, attributes=retry)
                 if conn.result["result"] == 0:
@@ -598,9 +587,9 @@ def import_user(
             return "updated", ""
         return "error", conn.result["description"]
     except LDAPConstraintViolationResult as e:
-        if reset_password_hash and "userPassword" in changes:
+        if reset_password and "userPassword" in changes:
             retry = dict(changes)
-            retry["userPassword"] = [(MODIFY_REPLACE, [reset_password_hash])]
+            retry["userPassword"] = [(MODIFY_REPLACE, [reset_password])]
             try:
                 conn.modify(dn, retry)
                 if conn.result["result"] == 0:
@@ -883,12 +872,13 @@ def main() -> None:
     console.rule("[bold]Step 4 — Import users")
     console.print()
 
-    reset_hash: Optional[str] = None
+    reset_plaintext: Optional[str] = None
     if args.reset_rejected_passwords:
-        reset_hash = argon2_ldap_hash(args.reset_password_value)
+        reset_plaintext = args.reset_password_value
         console.print(
             f"  [magenta]Reset-on-reject enabled[/magenta] — rejected passwords will "
-            f"be replaced with the Argon2 hash of [bold]{args.reset_password_value}[/bold]\n"
+            f"be replaced with the plaintext [bold]{args.reset_password_value}[/bold] "
+            f"(server will hash it via olcPasswordHash)\n"
         )
 
     counters: dict[str, int] = defaultdict(int)
@@ -908,7 +898,7 @@ def main() -> None:
             update=args.update,
             skip_existing=args.skip_existing,
             dry_run=args.dry_run,
-            reset_password_hash=reset_hash,
+            reset_password=reset_plaintext,
         )
         counters[status] += 1
 
