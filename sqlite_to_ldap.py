@@ -19,7 +19,10 @@ Features
 - Auto-detects source base DN from the export_run table
 - Rewrites DNs when the target base DN differs from the source
 - Creates missing intermediate OUs before importing users
-- Supports create (default), update (--update), or skip (--skip-existing) modes
+- Defaults to update mode (use --skip-existing to opt out)
+- Imports the original userPassword and flags users with pwdReset=TRUE so
+  they must change their password on next login (--no-force-password-change opts out)
+- Protected uids (default: frquser, sut2k) are skipped entirely
 - Dry-run support (--dry-run)
 - Per-user progress table + final summary
 
@@ -27,6 +30,7 @@ Dependencies: pip install ldap3 rich
 """
 
 import argparse
+import base64
 import getpass
 import json
 import re
@@ -35,21 +39,7 @@ import ssl
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
-# ldif3 is unmaintained and calls base64.decodestring / encodestring, which were
-# removed in Python 3.9. Restore aliases before importing so the module loads
-# under modern Python.
-import base64 as _base64
-if not hasattr(_base64, "decodestring"):
-    _base64.decodestring = _base64.decodebytes
-if not hasattr(_base64, "encodestring"):
-    _base64.encodestring = _base64.encodebytes
-
-try:
-    from ldif3 import LDIFParser
-    LDIF3 = True
-except ImportError:
-    LDIF3 = False  # only required when --ldif is used; checked in read_ldif_users()
+from typing import Iterator, Optional
 
 try:
     from ldap3 import (
@@ -98,6 +88,10 @@ except ImportError:
 # Matches DEFAULT_PASSWORD in ldap_to_sqlite.py, so a round-trip "ppolicy
 # absent → ppolicy present" import lands on the same plaintext.
 DEFAULT_RESET_PASSWORD = "Changeme12345!"
+
+# Service-account uids that must never be created or modified by the import.
+# Override at the command line via --protect-uids.
+DEFAULT_PROTECTED_UIDS = "frquser,sut2k"
 
 
 # ── attribute mapping: SQLite column → LDAP attribute name ──────────────────
@@ -184,16 +178,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--update",
-        action="store_true",
-        help="Overwrite attributes of existing entries instead of erroring.",
-    )
-    mode.add_argument(
+    p.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Silently skip entries that already exist (default: error on conflict).",
+        help="Silently skip entries that already exist (default: update them).",
+    )
+    p.add_argument(
+        "--no-force-password-change",
+        action="store_true",
+        help=(
+            "Don't set pwdReset=TRUE on imported users. By default every"
+            " added or updated user is flagged so they must change their"
+            " password on next login (requires the ppolicy schema on the target)."
+        ),
+    )
+    p.add_argument(
+        "--protect-uids",
+        default=DEFAULT_PROTECTED_UIDS,
+        help=(
+            "Comma-separated uids that must never be created or modified."
+            " Matching source entries are skipped entirely. Default: %(default)s."
+        ),
     )
 
     p.add_argument(
@@ -519,6 +524,10 @@ def import_user(
     substituted for userPassword. Sending plaintext lets ppolicy run its own
     quality checks (it rejects pre-hashed values outright under
     pwdCheckQuality=2) and lets the server hash it via olcPasswordHash.
+
+    On update, userPassword is applied in a separate modify from the other
+    attributes so a ppolicy rejection (or a "not being changed" no-op) does
+    not atomically roll back the other attribute changes alongside it.
     """
     if dry_run:
         exists = False
@@ -540,17 +549,24 @@ def import_user(
     except LDAPEntryAlreadyExistsResult:
         pass
     except LDAPConstraintViolationResult as e:
-        if reset_password and "userPassword" in attrs:
-            retry = dict(attrs)
-            retry["userPassword"] = reset_password
-            try:
-                conn.add(dn, attributes=retry)
-                if conn.result["result"] == 0:
-                    return "reset", "added with reset password"
+        if not (reset_password and "userPassword" in attrs):
+            return "error", str(e)
+        # ppolicy rejected the hash — retry add with the plaintext so the
+        # server can hash it via olcPasswordHash. If the retry fails with
+        # entryAlreadyExists, the entry was actually already there: fall
+        # through to the update path carrying the reset password forward.
+        attrs = dict(attrs)
+        attrs["userPassword"] = reset_password
+        try:
+            conn.add(dn, attributes=attrs)
+            if conn.result["result"] == 0:
+                return "reset", "added with reset password"
+            if conn.result["result"] != 68:
                 return "error", f"reset-retry failed: {conn.result['description']}"
-            except LDAPException as e2:
-                return "error", f"reset-retry failed: {e2}"
-        return "error", str(e)
+        except LDAPEntryAlreadyExistsResult:
+            pass
+        except LDAPException as e2:
+            return "error", f"reset-retry failed: {e2}"
     except LDAPException as e:
         return "error", str(e)
 
@@ -562,10 +578,14 @@ def import_user(
         return "error", "entry already exists (use --update or --skip-existing)"
 
     # ── update: replace every attribute we have ──
+    # userPassword is applied in its own modify below; keep it out of the
+    # bulk change set so a ppolicy rejection doesn't atomically roll back
+    # the other attribute updates.
+    pw_val = attrs.get("userPassword")
     changes = {
         attr: [(MODIFY_REPLACE, val if isinstance(val, list) else [val])]
         for attr, val in attrs.items()
-        if attr != "objectClass"   # objectClass changes need careful handling
+        if attr not in ("objectClass", "userPassword")
     }
     # objectClass: add missing classes, but don't remove existing ones
     try:
@@ -583,23 +603,68 @@ def import_user(
 
     try:
         conn.modify(dn, changes)
-        if conn.result["result"] == 0:
-            return "updated", ""
-        return "error", conn.result["description"]
-    except LDAPConstraintViolationResult as e:
-        if reset_password and "userPassword" in changes:
-            retry = dict(changes)
-            retry["userPassword"] = [(MODIFY_REPLACE, [reset_password])]
-            try:
-                conn.modify(dn, retry)
-                if conn.result["result"] == 0:
-                    return "reset", "updated with reset password"
-                return "error", f"reset-retry failed: {conn.result['description']}"
-            except LDAPException as e2:
-                return "error", f"reset-retry failed: {e2}"
-        return "error", str(e)
+        if conn.result["result"] != 0:
+            return "error", conn.result["description"]
     except LDAPException as e:
         return "error", str(e)
+
+    if pw_val is None:
+        return "updated", ""
+
+    pw_value = pw_val if isinstance(pw_val, list) else [pw_val]
+    try:
+        conn.modify(dn, {"userPassword": [(MODIFY_REPLACE, pw_value)]})
+        if conn.result["result"] == 0:
+            return "updated", ""
+        return "error", f"password update failed: {conn.result['description']}"
+    except LDAPConstraintViolationResult as e:
+        # First attempt may fail because ppolicy rejects the supplied hash
+        # (pwdCheckQuality=2 refuses pre-hashed values) or because the new
+        # value matches what's already stored ("not being changed").
+        if "not being changed" in (e.message or "").lower():
+            return "updated", "password unchanged"
+        if not reset_password:
+            return "error", f"password update failed: {e}"
+        try:
+            conn.modify(dn, {"userPassword": [(MODIFY_REPLACE, [reset_password])]})
+            if conn.result["result"] == 0:
+                return "reset", "updated with reset password"
+            return "error", f"reset-retry failed: {conn.result['description']}"
+        except LDAPConstraintViolationResult as e2:
+            # Re-imports land here: target already holds the reset
+            # plaintext, so ppolicy refuses a MODIFY_REPLACE that would
+            # leave userPassword unchanged. The account is in the state
+            # we want — surface it as a successful reset.
+            if "not being changed" in (e2.message or "").lower():
+                return "reset", "already at reset password"
+            return "error", f"reset-retry failed: {e2}"
+        except LDAPException as e2:
+            return "error", f"reset-retry failed: {e2}"
+    except LDAPException as e:
+        return "error", f"password update failed: {e}"
+
+
+# ── pwdReset (force password change on next login) ───────────────────────────
+
+def force_password_change(
+    conn: Connection, dn: str, dry_run: bool
+) -> tuple[bool, str]:
+    """Set pwdReset=TRUE so the user must change password on next login.
+
+    pwdReset is defined by the OpenLDAP ppolicy schema; the modify fails with
+    'undefined attribute type' if that schema isn't loaded on the target. The
+    user import itself has already succeeded — the caller surfaces the failure
+    in the per-user result column without aborting the run.
+    """
+    if dry_run:
+        return True, "would set pwdReset=TRUE"
+    try:
+        conn.modify(dn, {"pwdReset": [(MODIFY_REPLACE, ["TRUE"])]})
+        if conn.result["result"] == 0:
+            return True, "pwdReset=TRUE"
+        return False, conn.result["description"]
+    except LDAPException as e:
+        return False, str(e)
 
 
 # ── group-membership reconstruction ──────────────────────────────────────────
@@ -675,48 +740,60 @@ def sync_group_memberships(
 
 
 # ── LDIF reader ──────────────────────────────────────────────────────────────
+# Minimal RFC 2849 reader extracted from ldif3 (MIT-licensed, abandoned upstream).
+# Only the entry-record subset we need: line folding, blank-line record split,
+# `attr: text` / `attr:: base64`. `attr:< url` references are not consumed
+# (we never emit them) and the entire `changetype:` machinery is omitted.
 
 USER_OBJECT_CLASSES = {"inetorgperson", "posixaccount", "shadowaccount", "person"}
 
 
-def _decode_ldif_value(v) -> str:
-    if isinstance(v, bytes):
-        return v.decode("utf-8", errors="replace")
-    return v
-
-
-def _is_entry_block(lines: list[bytes]) -> bool:
-    for l in lines:
-        s = l.strip()
-        if not s or s.startswith(b"#"):
-            continue
-        return s.lower().startswith(b"dn:")
-    return False
-
-
-def _strip_search_preamble(path: str) -> bytes:
-    """
-    The LDIF files we ingest may be raw `ldapsearch -LLL` output, which
-    interleaves entry records with preamble/result blocks
-    (`search: 2`, `result: 0 Success`, `# numResponses: …`). ldif3 rejects
-    anything that isn't a clean record sequence, so drop the non-entry blocks
-    here and feed the cleaned bytes to the parser.
-    """
-    out: list[bytes] = []
+def _iter_ldif_blocks(path: str) -> Iterator[list[bytes]]:
+    """Yield non-empty blocks of unfolded, comment-free logical lines.
+    A block is a maximal run separated by blank lines. Continuation lines
+    (a leading space, per RFC 2849 §2.2) are appended to the previous line."""
     block: list[bytes] = []
+    logical: Optional[bytes] = None
+
+    def flush_logical():
+        if logical is not None and not logical.startswith(b"#"):
+            block.append(logical)
+
     with open(path, "rb") as f:
-        for line in f:
-            if not line.strip():
-                if block and _is_entry_block(block):
-                    out.extend(block)
-                    out.append(b"\n")
-                block = []
+        for raw in f:
+            line = raw.rstrip(b"\r\n")
+            if line.startswith(b" ") and logical is not None:
+                logical += line[1:]
+                continue
+            flush_logical()
+            logical = None
+            if not line:
+                if block:
+                    yield block
+                    block = []
             else:
-                block.append(line)
-        if block and _is_entry_block(block):
-            out.extend(block)
-            out.append(b"\n")
-    return b"".join(out)
+                logical = line
+        flush_logical()
+        if block:
+            yield block
+
+
+def _parse_ldif_attr(line: bytes) -> tuple[str, bytes]:
+    """Parse one `attr: value` / `attr:: base64` line. Returns the attribute
+    name (original case) and the raw byte value. Raises ValueError if there
+    is no colon (caller treats that as a non-attribute line)."""
+    colon = line.index(b":")
+    attr = line[:colon].decode("ascii")
+    rest = line[colon + 1:]
+    if rest.startswith(b":"):
+        return attr, base64.b64decode(rest[1:].strip())
+    if rest.startswith(b"<"):
+        return attr, b""  # URL references unsupported — same default as ldif3
+    return attr, rest.lstrip(b" ")
+
+
+def _decode_ldif_value(v: bytes) -> str:
+    return v.decode("utf-8", errors="replace")
 
 
 def read_ldif_users(path: str) -> list[dict]:
@@ -724,23 +801,32 @@ def read_ldif_users(path: str) -> list[dict]:
     Parse an LDIF export and return rows shaped like the SQLite ldap_users
     table, so the downstream pipeline (row_to_attrs, rewrite_dn,
     ensure_structure, import_user) works unchanged.
-    """
-    if not LDIF3:
-        sys.exit("ldif3 not installed — run: pip install ldif3")
 
-    # LDAP attribute (lower) → SQLite column
+    Tolerates raw `ldapsearch -LLL` output: blocks without a `dn:` line
+    (search/result preamble, `# numResponses: …`) are skipped silently.
+    """
     attr_to_col = {ldap_attr.lower(): col for col, ldap_attr in COLUMN_TO_ATTR.items()}
 
     console.print(f"Reading LDIF file: [bold]{path}[/bold]")
 
-    from io import BytesIO
-    cleaned = _strip_search_preamble(path)
-
     users: list[dict] = []
-    for dn, entry in LDIFParser(BytesIO(cleaned)).parse():
-        norm = {k.lower(): v for k, v in entry.items()}
+    for block in _iter_ldif_blocks(path):
+        dn: Optional[str] = None
+        entry: dict[str, list[bytes]] = {}
+        for line in block:
+            try:
+                attr, val = _parse_ldif_attr(line)
+            except ValueError:
+                continue
+            if attr.lower() == "dn":
+                dn = _decode_ldif_value(val)
+            else:
+                entry.setdefault(attr.lower(), []).append(val)
 
-        object_classes = [_decode_ldif_value(v) for v in norm.get("objectclass", [])]
+        if dn is None:
+            continue  # ldapsearch preamble/result block
+
+        object_classes = [_decode_ldif_value(v) for v in entry.get("objectclass", [])]
         if not ({c.lower() for c in object_classes} & USER_OBJECT_CLASSES):
             continue
 
@@ -749,17 +835,17 @@ def read_ldif_users(path: str) -> list[dict]:
             "object_classes": json.dumps(object_classes),
         }
 
-        for attr_lower, values in norm.items():
+        for attr_lower, values in entry.items():
             if attr_lower == "objectclass" or not values:
                 continue
             col = attr_to_col.get(attr_lower)
             if col is None:
                 continue
-            # Keep userPassword as raw bytes — utf-8 decoding with replacement
-            # would corrupt binary hashes. Other attrs are text.
+            # userPassword keeps raw bytes — utf-8 decode-with-replace would
+            # corrupt {SSHA}/{CRYPT} binary hashes. Other attrs are text.
             row[col] = values[0] if col == "user_password" else _decode_ldif_value(values[0])
 
-        mo = norm.get("memberof")
+        mo = entry.get("memberof")
         if mo:
             row["member_of"] = json.dumps([_decode_ldif_value(v) for v in mo])
 
@@ -771,12 +857,13 @@ def read_ldif_users(path: str) -> list[dict]:
 # ── progress table ────────────────────────────────────────────────────────────
 
 _STATUS_STYLE = {
-    "added":    "green",
-    "updated":  "cyan",
-    "reset":    "magenta",
-    "skipped":  "dim",
-    "dry-run":  "yellow",
-    "error":    "red",
+    "added":     "green",
+    "updated":   "cyan",
+    "reset":     "magenta",
+    "skipped":   "dim",
+    "protected": "blue",
+    "dry-run":   "yellow",
+    "error":     "red",
 }
 
 
@@ -784,6 +871,10 @@ _STATUS_STYLE = {
 
 def main() -> None:
     args = parse_args()
+
+    protected_uids = {
+        u.strip().lower() for u in args.protect_uids.split(",") if u.strip()
+    }
 
     console.rule("[bold blue]SQLite → OpenLDAP Import")
     console.print(f"  Started at [bold]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/bold]")
@@ -864,7 +955,12 @@ def main() -> None:
     icon = "[green]created[/green]" if created else f"[dim]{status}[/dim]"
     console.print(icon)
 
-    all_new_dns = [dn for dn, _, _ in rewritten]
+    # Protected users are skipped entirely, so don't scaffold OUs that exist
+    # only to host one.
+    all_new_dns = [
+        dn for dn, _, row in rewritten
+        if (row.get("uid") or "").strip().lower() not in protected_uids
+    ]
     ensure_structure(conn, all_new_dns, tgt_base, args.dry_run)
 
     # ── 5. Import users ───────────────────────────────────────────────────────
@@ -878,14 +974,26 @@ def main() -> None:
         console.print(
             f"  [magenta]Reset-on-reject enabled[/magenta] — rejected passwords will "
             f"be replaced with the plaintext [bold]{args.reset_password_value}[/bold] "
-            f"(server will hash it via olcPasswordHash)\n"
+            f"(server will hash it via olcPasswordHash)"
         )
+    if protected_uids:
+        console.print(
+            f"  [blue]Protected uids (never touched):[/blue] "
+            f"{', '.join(sorted(protected_uids))}"
+        )
+    if not args.no_force_password_change:
+        console.print(
+            "  [cyan]Force password change[/cyan] — pwdReset=TRUE will be set on"
+            " every imported user (requires ppolicy schema on the target)"
+        )
+    console.print()
 
     counters: dict[str, int] = defaultdict(int)
     table_rows: list[tuple] = []
 
     for new_dn, attrs, row in rewritten:
         uid  = row.get("uid") or "—"
+        uid_key = (row.get("uid") or "").strip().lower()
         cn   = row.get("cn")  or "—"
         mail = row.get("mail") or "—"
         pw_note = (
@@ -893,14 +1001,30 @@ def main() -> None:
             else "[dim]original hash[/dim]"
         )
 
+        if uid_key in protected_uids:
+            status, detail = "protected", "uid is protected, untouched"
+            counters[status] += 1
+            display = f"{status} — {detail}"
+            table_rows.append((new_dn, uid, cn[:28], mail[:28], pw_note, status, display))
+            continue
+
         status, detail = import_user(
             conn, new_dn, attrs,
-            update=args.update,
+            update=not args.skip_existing,
             skip_existing=args.skip_existing,
             dry_run=args.dry_run,
             reset_password=reset_plaintext,
         )
         counters[status] += 1
+
+        if (
+            status in ("added", "updated", "reset", "dry-run")
+            and not args.no_force_password_change
+        ):
+            ok, fdetail = force_password_change(conn, new_dn, args.dry_run)
+            counters["pwdreset_ok" if ok else "pwdreset_failed"] += 1
+            tag = fdetail if ok else f"pwdReset failed: {fdetail}"
+            detail = f"{detail}; {tag}" if detail else tag
 
         display = status + (f" — {detail}" if detail else "")
         table_rows.append((new_dn, uid, cn[:28], mail[:28], pw_note, status, display))
@@ -938,8 +1062,12 @@ def main() -> None:
     # ── 5. Reconstruct group membership ──────────────────────────────────────
     console.print()
     console.rule("[bold]Step 5 — Sync group membership")
+    importable = [
+        (dn, attrs, row) for dn, attrs, row in rewritten
+        if (row.get("uid") or "").strip().lower() not in protected_uids
+    ]
     mb_counts = sync_group_memberships(
-        conn, rewritten, src_base or "", tgt_base, args.dry_run
+        conn, importable, src_base or "", tgt_base, args.dry_run
     )
 
     # ── 6. Summary ────────────────────────────────────────────────────────────
@@ -955,8 +1083,11 @@ def main() -> None:
         ("Updated",         str(counters["updated"])),
         ("Passwords reset", str(counters["reset"])),
         ("Skipped",         str(counters["skipped"])),
+        ("Protected",       str(counters["protected"])),
         ("Dry-run",         str(counters["dry-run"])),
         ("Errors",          str(counters["error"])),
+        ("pwdReset set",    str(counters["pwdreset_ok"])),
+        ("pwdReset failed", str(counters["pwdreset_failed"])),
         ("Group links added",    str(mb_counts.get("added", 0))),
         ("Already member",       str(mb_counts.get("already_member", 0))),
         ("Group links (dry-run)", str(mb_counts.get("dry-run", 0))),
@@ -964,7 +1095,8 @@ def main() -> None:
         ("Group link errors",    str(mb_counts.get("error", 0))),
     ]
     for k, v in totals:
-        style = "red" if k in ("Errors", "Group link errors") and v != "0" else "white"
+        red_keys = ("Errors", "Group link errors", "pwdReset failed")
+        style = "red" if k in red_keys and v != "0" else "white"
         console.print(f"  [bold cyan]{k:<22}[/bold cyan]  [{style}]{v}[/{style}]")
     console.print()
 

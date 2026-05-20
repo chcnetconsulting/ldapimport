@@ -3,12 +3,14 @@
 ldap_to_sqlite.py — Export OpenLDAP users to SQLite.
 
 Connects via ldapi:/// or ldaps://localhost:636 (tries in that order).
-Writes a server overview, detects ppolicy, exports all user entries,
-and — when ppolicy is absent — resets every password to an Argon2 hash
-of the DEFAULT_PASSWORD constant.
+Writes a server overview, detects ppolicy (informational only), and
+exports every user entry as-is. The source directory is never modified;
+userPassword values are recorded exactly as the server returns them so
+the import side can replay them and let ppolicy on the target enforce
+the next-login password change.
 
 Dependencies:
-    pip install ldap3 argon2-cffi rich
+    pip install ldap3 rich
 """
 
 import argparse
@@ -27,7 +29,6 @@ try:
         ALL,
         ALL_ATTRIBUTES,
         BASE,
-        MODIFY_REPLACE,
         SASL,
         SUBTREE,
         Connection,
@@ -37,11 +38,6 @@ try:
     from ldap3.core.exceptions import LDAPException, LDAPNoSuchObjectResult
 except ImportError:
     sys.exit("ldap3 not installed — run: pip install ldap3")
-
-try:
-    from argon2 import PasswordHasher
-except ImportError:
-    sys.exit("argon2-cffi not installed — run: pip install argon2-cffi")
 
 try:
     from rich import box
@@ -70,7 +66,6 @@ except ImportError:
 
 # ── constants ───────────────────────────────────────────────────────────────
 
-DEFAULT_PASSWORD = "Changeme12345!"
 PPOLICY_CONTROL_OID = "1.3.6.1.4.1.42.2.27.8.5.1"
 
 # objectClass filter that catches the most common user entry types
@@ -119,11 +114,6 @@ def parse_args() -> argparse.Namespace:
         "--db",
         default="ldap_export.sqlite",
         help="SQLite output file (default: ldap_export.sqlite)",
-    )
-    p.add_argument(
-        "--no-reset",
-        action="store_true",
-        help="Never reset passwords, even when ppolicy is absent",
     )
     p.add_argument(
         "--ca-cert",
@@ -373,7 +363,7 @@ def print_overview(facts: dict, ppolicy_active: bool, base_dn: str) -> None:
             row(k, cfg[k])
 
     pp_text = "[green]YES — passwords are managed by ppolicy[/green]" if ppolicy_active \
-        else "[red]NO  — passwords will be reset to Argon2 hash of DEFAULT_PASSWORD[/red]"
+        else "[yellow]NO  — informational only, export does not modify the source[/yellow]"
     row("ppolicy Active", pp_text)
 
     if RICH:
@@ -510,7 +500,6 @@ CREATE TABLE IF NOT EXISTS ldap_users (
     gecos               TEXT,
     room_number         TEXT,
     labeled_uri         TEXT,
-    password_was_reset  INTEGER DEFAULT 0,   -- 1 = yes
     export_timestamp    TEXT
 );
 
@@ -520,7 +509,6 @@ CREATE TABLE IF NOT EXISTS export_run (
     ldap_uri        TEXT,
     base_dn         TEXT,
     total_users     INTEGER,
-    passwords_reset INTEGER,
     ppolicy_active  INTEGER
 );
 """
@@ -615,37 +603,8 @@ def entry_to_row(entry, now: str) -> dict:
         "gecos":               _str(entry, "gecos"),
         "room_number":         _str(entry, "roomNumber"),
         "labeled_uri":         _str(entry, "labeledURI"),
-        "password_was_reset":  0,
         "export_timestamp":    now,
     }
-
-
-# ── password reset ───────────────────────────────────────────────────────────
-
-_ph = PasswordHasher(
-    time_cost=2,
-    memory_cost=65536,
-    parallelism=2,
-    hash_len=32,
-    salt_len=16,
-)
-
-
-def argon2_ldap_hash(password: str) -> str:
-    """Return {ARGON2}<hash> — compatible with OpenLDAP's pw-argon2 module."""
-    raw = _ph.hash(password)          # $argon2id$v=19$…
-    return f"{{ARGON2}}{raw}"
-
-
-def reset_password(conn: Connection, dn: str) -> bool:
-    """Modify userPassword on *dn* in the live LDAP directory."""
-    new_hash = argon2_ldap_hash(DEFAULT_PASSWORD)
-    try:
-        conn.modify(dn, {"userPassword": [(MODIFY_REPLACE, [new_hash])]})
-        return conn.result["result"] == 0
-    except LDAPException as e:
-        console.print(f"  [red]LDAP modify failed for {dn}: {e}[/red]")
-        return False
 
 
 # ── progress table ────────────────────────────────────────────────────────────
@@ -667,18 +626,14 @@ def _make_progress_table() -> "Table":
 # ── main export loop ─────────────────────────────────────────────────────────
 
 def export(
-    conn: Connection,
     db: sqlite3.Connection,
     users: list,
     uri: str,
     base_dn: str,
-    ppolicy_active: bool,
-    do_reset: bool,
-) -> tuple[int, int]:
-    """Insert users into SQLite, optionally reset passwords. Returns (total, resets)."""
+) -> int:
+    """Insert users into SQLite as-is. Returns the row count."""
     now = datetime.now(timezone.utc).isoformat()
     total = 0
-    resets = 0
 
     console.rule("[bold blue]User Export")
     console.print()
@@ -695,20 +650,8 @@ def export(
         uid = row["uid"] or "—"
         cn  = row["cn"]  or "—"
         mail= row["mail"] or "—"
-        pw_status = "[dim]kept[/dim]"
+        pw_status = "kept" if row.get("user_password") else "none"
 
-        if do_reset:
-            ok = reset_password(conn, dn)
-            if ok:
-                new_hash = argon2_ldap_hash(DEFAULT_PASSWORD)
-                row["user_password"]    = new_hash
-                row["password_was_reset"] = 1
-                pw_status = "[green]RESET → Argon2[/green]"
-                resets += 1
-            else:
-                pw_status = "[red]reset FAILED[/red]"
-
-        # Upsert into SQLite
         placeholders = ", ".join([f":{k}" for k in row])
         cols         = ", ".join(row.keys())
         db.execute(
@@ -720,18 +663,12 @@ def export(
         plain_rows.append((dn[:60], uid, cn[:30], mail[:30], pw_status))
 
         if RICH:
-            # strip markup for the display value
-            clean_status = pw_status.replace("[green]", "").replace("[/green]", "") \
-                                    .replace("[red]", "").replace("[/red]", "") \
-                                    .replace("[dim]", "").replace("[/dim]", "")
             prog_table.add_row(
                 Text(dn[:70], overflow="ellipsis"),
                 uid[:20],
                 cn[:30],
                 mail[:30],
-                Text(clean_status,
-                     style="green" if "RESET" in clean_status
-                     else ("red" if "FAILED" in clean_status else "dim")),
+                Text(pw_status, style="dim"),
             )
 
     db.commit()
@@ -739,18 +676,14 @@ def export(
     if RICH:
         console.print(prog_table)
     else:
-        # Plain fallback table
         header = f"{'DN':<62}  {'UID':<18}  {'CN':<30}  {'Mail':<30}  {'Password'}"
         print("\n" + header)
         print("─" * len(header))
         for r in plain_rows:
-            # strip markup
-            import re
-            pw_clean = re.sub(r"\[/?[^\]]*\]", "", r[4])
-            print(f"{r[0]:<62}  {r[1]:<18}  {r[2]:<30}  {r[3]:<30}  {pw_clean}")
+            print(f"{r[0]:<62}  {r[1]:<18}  {r[2]:<30}  {r[3]:<30}  {r[4]}")
 
     console.print()
-    return total, resets
+    return total
 
 
 # ── final summary ─────────────────────────────────────────────────────────────
@@ -760,7 +693,6 @@ def print_summary(
     uri: str,
     base_dn: str,
     total: int,
-    resets: int,
     ppolicy_active: bool,
 ) -> None:
     console.rule("[bold blue]Export Summary")
@@ -770,9 +702,7 @@ def print_summary(
         ("LDAP URI",          uri),
         ("Base DN",           base_dn),
         ("Users exported",    str(total)),
-        ("Passwords reset",   str(resets)),
         ("ppolicy active",    "yes" if ppolicy_active else "no"),
-        ("Default password",  DEFAULT_PASSWORD if resets else "—"),
     ]
     for k, v in lines:
         console.print(f"  [bold cyan]{k:<22}[/bold cyan]  {v}")
@@ -799,7 +729,6 @@ def main() -> None:
     # ── 3. Detect ppolicy ───────────────────────────────────────────────────
     console.rule("[bold]Step 3 — Detect ppolicy")
     ppolicy_active = check_ppolicy(conn, facts)
-    do_reset = (not ppolicy_active) and (not args.no_reset)
 
     # ── 4. Print overview ────────────────────────────────────────────────────
     base_dn = resolve_base_dn(conn, args)
@@ -817,16 +746,16 @@ def main() -> None:
     console.print(f"  Database: [bold]{args.db}[/bold]")
     db = init_db(args.db)
 
-    # ── 7. Export + optional password reset ──────────────────────────────────
-    total, resets = export(conn, db, users, uri, base_dn, ppolicy_active, do_reset)
+    # ── 7. Export users as-is ────────────────────────────────────────────────
+    total = export(db, users, uri, base_dn)
 
     # ── 8. Record run metadata ────────────────────────────────────────────────
     db.execute(
         "INSERT INTO export_run (run_at, ldap_uri, base_dn, total_users, "
-        "passwords_reset, ppolicy_active) VALUES (?,?,?,?,?,?)",
+        "ppolicy_active) VALUES (?,?,?,?,?)",
         (
             datetime.now(timezone.utc).isoformat(),
-            uri, base_dn, total, resets,
+            uri, base_dn, total,
             1 if ppolicy_active else 0,
         ),
     )
@@ -835,14 +764,7 @@ def main() -> None:
     conn.unbind()
 
     # ── 9. Summary ────────────────────────────────────────────────────────────
-    print_summary(args.db, uri, base_dn, total, resets, ppolicy_active)
-
-    if do_reset and resets > 0:
-        console.print(
-            f"[bold yellow]NOTE[/bold yellow]: {resets} password(s) were reset in the live "
-            f"LDAP directory to the Argon2 hash of \"{DEFAULT_PASSWORD}\".  "
-            "Requires the [bold]pw-argon2[/bold] OpenLDAP module for authentication to work.\n"
-        )
+    print_summary(args.db, uri, base_dn, total, ppolicy_active)
 
 
 if __name__ == "__main__":
