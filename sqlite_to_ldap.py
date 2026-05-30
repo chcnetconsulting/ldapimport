@@ -377,6 +377,48 @@ def rewrite_dn(dn: str, src_base: str, tgt_base: str) -> str:
     return f"{','.join(prefix)},{tgt_base}" if prefix else tgt_base
 
 
+def detect_source_base(dns: list[str]) -> str:
+    """Best-effort source base DN inferred from a set of entry DNs.
+
+    LDIF exports (unlike the SQLite path) carry no export_run table recording
+    the base DN, so we derive it from the entries themselves. We take the
+    longest trailing run of ``dc=`` components shared by every DN — the domain
+    suffix in typical layouts (``uid=x,ou=users,dc=a,dc=b`` → ``dc=a,dc=b``).
+    Intermediate org units (``ou=users``) are deliberately kept OUT of the
+    base so they survive the rewrite onto the target base.
+
+    Falls back to the longest common trailing RDN run for bases that use no
+    ``dc=`` components (e.g. ``o=Acme,c=US``). Returns "" if nothing is shared.
+    """
+    if not dns:
+        return ""
+
+    def dc_suffix(dn: str) -> list[str]:
+        rdns = _split_dn(dn)
+        out: list[str] = []
+        for rdn in reversed(rdns):
+            if rdn.partition("=")[0].strip().lower() == "dc":
+                out.insert(0, rdn)
+            else:
+                break
+        return out
+
+    suffixes = [dc_suffix(d) for d in dns]
+    if all(suffixes) and len(
+        {tuple(_normalize_rdn(r) for r in s) for s in suffixes}
+    ) == 1:
+        return ",".join(suffixes[0])
+
+    # Fallback: longest common trailing RDN run across all DNs.
+    common: list[str] = []
+    for tail in zip(*(list(reversed(_split_dn(d))) for d in dns)):
+        if len({_normalize_rdn(r) for r in tail}) == 1:
+            common.insert(0, tail[0])
+        else:
+            break
+    return ",".join(common)
+
+
 # ── OU scaffolding ────────────────────────────────────────────────────────────
 
 
@@ -1064,6 +1106,12 @@ def main() -> None:
             sys.exit("No users found in the database.")
 
     src_base = args.source_base or meta.get("base_dn", "")
+    if not src_base and args.ldif:
+        src_base = detect_source_base([u["dn"] for u in users])
+        if src_base:
+            console.print(
+                f"  Auto-detected source base DN: [bold]{src_base}[/bold]"
+            )
     console.print(f"  Source         : [bold]{source_label}[/bold]")
     console.print(f"  Users to import: [bold]{len(users)}[/bold]")
     if meta:

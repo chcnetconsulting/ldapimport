@@ -52,6 +52,17 @@ olcModuleLoad: ${ARGON_FILE}
 olcModuleLoad: ppolicy
 EOF
 
+# Load the openssh-lpk schema (ldapPublicKey / sshPublicKey). Source exports
+# routinely carry SSH keys on user entries; without this schema those adds fail
+# with "invalid object class ldapPublicKey" and the import can't land users.
+ldapadd -Y EXTERNAL -H ldapi:/// <<EOF
+dn: cn=openssh-lpk,cn=schema,cn=config
+objectClass: olcSchemaConfig
+cn: openssh-lpk
+olcAttributeTypes: ( 1.3.6.1.4.1.24552.500.1.1.1.13 NAME 'sshPublicKey' DESC 'MANDATORY: OpenSSH Public key' EQUALITY octetStringMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
+olcObjectClasses: ( 1.3.6.1.4.1.24552.500.1.1.2.0 NAME 'ldapPublicKey' DESC 'MANDATORY: OpenSSH LPK objectclass' SUP top AUXILIARY MAY ( sshPublicKey \$ uid ) )
+EOF
+
 # Grant the data admin read on the config DB so a network bind as
 # cn=admin,dc=local,dc=test can see olcModuleLoad (the preflight's check).
 ldapmodify -Y EXTERNAL -H ldapi:/// <<EOF

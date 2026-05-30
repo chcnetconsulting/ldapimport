@@ -86,6 +86,35 @@ class TestRewriteDN:
         assert s2l.rewrite_dn(dn, "", "dc=anything") == dn
 
 
+class TestDetectSourceBase:
+    def test_dc_suffix_excludes_intermediate_ous(self):
+        # All users share ou=users, but the base is just the dc= domain so the
+        # OU survives the later rewrite onto the target base.
+        dns = [
+            "uid=alice,ou=users,dc=frequentis,dc=frq",
+            "uid=bob,ou=users,dc=frequentis,dc=frq",
+        ]
+        assert s2l.detect_source_base(dns) == "dc=frequentis,dc=frq"
+
+    def test_mixed_ous_under_same_domain(self):
+        dns = [
+            "uid=alice,ou=people,dc=example,dc=com",
+            "cn=admins,ou=groups,dc=example,dc=com",
+        ]
+        assert s2l.detect_source_base(dns) == "dc=example,dc=com"
+
+    def test_preserves_original_casing_of_first_entry(self):
+        dns = ["uid=alice,DC=Example,DC=Com", "uid=bob,dc=example,dc=com"]
+        assert s2l.detect_source_base(dns) == "DC=Example,DC=Com"
+
+    def test_falls_back_to_common_suffix_without_dc(self):
+        dns = ["cn=alice,ou=people,o=Acme,c=US", "cn=bob,ou=staff,o=Acme,c=US"]
+        assert s2l.detect_source_base(dns) == "o=Acme,c=US"
+
+    def test_empty_input_returns_empty(self):
+        assert s2l.detect_source_base([]) == ""
+
+
 class TestIntermediateDNs:
     def test_single_intermediate_ou(self):
         assert s2l.intermediate_dns(
