@@ -36,15 +36,20 @@ done
 ARGON_FILE="$(ls /usr/lib/ldap/ | grep -iE 'argon2.*\.(la|so)$' | head -1)"
 : "${ARGON_FILE:?argon2 module not found in /usr/lib/ldap — is slapd-contrib installed?}"
 
-# Adding the olcModuleLoad value loads the module immediately; a bad filename
-# makes this ldapadd fail, so the build stops loudly rather than shipping a
-# server that silently can't store {ARGON2}.
-ldapadd -Y EXTERNAL -H ldapi:/// <<EOF
+# The slapd package's default config already ships cn=module{0},cn=config
+# (it loads back_mdb), so we MODIFY that entry rather than add a new one —
+# re-adding the same RDN fails with a naming violation. Adding the
+# olcModuleLoad values loads the modules immediately; a bad filename makes this
+# ldapmodify fail, so the build stops loudly rather than shipping a server that
+# silently can't store {ARGON2} or enforce ppolicy. Loading the ppolicy module
+# (OpenLDAP 2.5+) also registers its schema (pwdPolicy object class, pwdReset
+# operational attr) — no separate schema load needed.
+ldapmodify -Y EXTERNAL -H ldapi:/// <<EOF
 dn: cn=module{0},cn=config
-objectClass: olcModuleList
-cn: module{0}
-olcModulePath: /usr/lib/ldap
+changetype: modify
+add: olcModuleLoad
 olcModuleLoad: ${ARGON_FILE}
+olcModuleLoad: ppolicy
 EOF
 
 # Grant the data admin read on the config DB so a network bind as
@@ -56,8 +61,38 @@ add: olcAccess
 olcAccess: to * by dn.exact="cn=admin,dc=local,dc=test" read by * break
 EOF
 
-# Confirm the scheme is actually registered before we finish the build.
+# Enable the ppolicy overlay on the data DB so the import can write pwdReset
+# and so pre-hashed userPassword values (sent with the Relax control) are
+# accepted without a quality check. olcPPolicyHashCleartext lets the server
+# hash any cleartext fallback password the import sends.
+ldapadd -Y EXTERNAL -H ldapi:/// <<EOF
+dn: olcOverlay=ppolicy,olcDatabase={1}mdb,cn=config
+objectClass: olcOverlayConfig
+objectClass: olcPPolicyConfig
+olcOverlay: ppolicy
+olcPPolicyDefault: cn=default,ou=policies,dc=local,dc=test
+olcPPolicyHashCleartext: TRUE
+olcPPolicyUseLockout: TRUE
+EOF
+
+# Create the policy subtree + default policy in the data DB. pwdMustChange
+# makes pwdReset=TRUE actually force a change on next login.
+ldapadd -x -D "cn=admin,dc=local,dc=test" -w "${ADMIN_PW}" -H ldapi:/// <<EOF
+dn: ou=policies,dc=local,dc=test
+objectClass: organizationalUnit
+ou: policies
+
+dn: cn=default,ou=policies,dc=local,dc=test
+objectClass: pwdPolicy
+objectClass: device
+cn: default
+pwdAttribute: userPassword
+pwdMustChange: TRUE
+EOF
+
+# Confirm the modules and overlay are actually registered before finishing.
 ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config '(olcModuleLoad=*)' olcModuleLoad
+ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config '(olcOverlay=ppolicy)' olcOverlay olcPPolicyDefault
 
 # Stop the temporary instance; the container CMD starts the real one.
 PID="$(cat /var/run/slapd/slapd.pid 2>/dev/null || pgrep -x slapd || true)"
