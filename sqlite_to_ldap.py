@@ -93,6 +93,15 @@ DEFAULT_RESET_PASSWORD = "Changeme12345!"
 # Override at the command line via --protect-uids.
 DEFAULT_PROTECTED_UIDS = "frquser,sut2k"
 
+# draft-zeilenga-ldap-relax: the Relax control tells the server "I'm a
+# privileged admin doing a maintenance op, skip the usual checks." OpenLDAP's
+# slapo-ppolicy honors it for both pre-hashed userPassword writes (no quality
+# check on the supplied value) and for pwdReset (an operational attribute
+# normally not writable from outside). criticality=False so servers that
+# don't recognize the control still process the operation — the
+# reset_password fallback handles any quality rejection that still occurs.
+RELAX_RULES_CONTROL = ("1.3.6.1.4.1.4203.666.5.12", False, None)
+
 
 # ── attribute mapping: SQLite column → LDAP attribute name ──────────────────
 
@@ -219,15 +228,25 @@ def parse_args() -> argparse.Namespace:
         "--reset-rejected-passwords",
         action="store_true",
         help=(
-            "When the target ppolicy rejects a userPassword (constraintViolation),"
-            " retry with the plaintext default password so the server can run its"
-            " own quality checks and hash it under olcPasswordHash."
+            "Fallback when ppolicy still rejects a userPassword even with the"
+            " Relax control attached (e.g. the bind identity lacks Relax"
+            " authority): retry with the plaintext default password so the"
+            " server can run its own quality checks and hash it under"
+            " olcPasswordHash."
         ),
     )
     p.add_argument(
         "--reset-password-value",
         default=DEFAULT_RESET_PASSWORD,
         help="Plaintext used for the reset retry. Default: %(default)s.",
+    )
+    p.add_argument(
+        "--skip-argon2-check",
+        action="store_true",
+        help=(
+            "Skip the preflight that verifies the target has the argon2"
+            " password module loaded before importing {ARGON2} hashes."
+        ),
     )
 
     return p.parse_args()
@@ -502,6 +521,186 @@ def row_to_attrs(row: dict, import_ppolicy: bool) -> dict:
     return attrs
 
 
+# ── userPassword application ─────────────────────────────────────────────────
+
+def _password_is_hashed(value: object) -> bool:
+    """A captured userPassword is pre-hashed when it carries a `{SCHEME}` prefix.
+
+    We only inspect the first value: ldap_users rows hold a single password
+    and LDIF/SQLite paths both surface it as a single str/bytes value.
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, bytes):
+        return value.startswith(b"{")
+    if isinstance(value, str):
+        return value.startswith("{")
+    return False
+
+
+def _password_scheme(value: object) -> Optional[str]:
+    """Return the upper-cased ``{SCHEME}`` name of a userPassword value
+    (e.g. ``ARGON2``, ``CRYPT``, ``SSHA``), or None when it carries no scheme
+    prefix (plaintext). Inspects only the first value, matching
+    :func:`_password_is_hashed`."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, bytes):
+        value = value.decode("ascii", "ignore")
+    if not isinstance(value, str) or not value.startswith("{"):
+        return None
+    end = value.find("}")
+    return value[1:end].upper() if end > 1 else None
+
+
+def preflight_argon2(conn: Connection, users: list[dict], skip: bool) -> None:
+    """Verify the target loads the argon2 module when any user carries an
+    ``{ARGON2}`` userPassword.
+
+    Argon2 hashes are stored verbatim under the Relax control, so the server
+    must recognise the scheme. A server without ``pw-argon2`` rejects the
+    MODIFY with a generic error (not a ppolicy constraint), so the
+    reset-password fallback never fires and every Argon2 user fails to import
+    while ``{CRYPT}``/``{SSHA}`` users still succeed — a confusing partial
+    failure this check turns into one clear up-front error.
+
+    Detection reads ``olcModuleLoad`` from ``cn=config`` (best-effort): when
+    that subtree isn't readable by the bind identity — common for simple binds
+    to the data backend — we can't confirm and only warn. Aborts only when the
+    module is positively absent.
+    """
+    argon2_users = [
+        u for u in users if _password_scheme(u.get("user_password")) == "ARGON2"
+    ]
+    if not argon2_users:
+        return
+
+    n = len(argon2_users)
+    if skip:
+        console.print(
+            f"  [yellow]Skipping argon2 module preflight[/yellow] "
+            f"({n} {{ARGON2}} user(s)) — --skip-argon2-check set."
+        )
+        return
+
+    console.print(
+        f"  {n} user(s) carry {{ARGON2}} hashes — checking target loads the "
+        "argon2 module …",
+        end=" ",
+    )
+
+    try:
+        found = conn.search(
+            "cn=config",
+            "(olcModuleLoad=*)",
+            search_scope=SUBTREE,
+            attributes=["olcModuleLoad"],
+        )
+    except LDAPException as e:
+        console.print(f"[yellow]could not verify[/yellow] ({e})")
+        _warn_argon2_unverified()
+        return
+
+    if not found:
+        console.print("[yellow]could not verify[/yellow] (cn=config not readable)")
+        _warn_argon2_unverified()
+        return
+
+    loaded = any(
+        "argon2" in str(v).lower()
+        for entry in conn.entries
+        for v in entry.olcModuleLoad.values
+    )
+    if loaded:
+        console.print("[green]argon2 loaded[/green]")
+        return
+
+    console.print("[red]argon2 NOT loaded[/red]")
+    sys.exit(
+        f"\nThe target server does not have the argon2 password module loaded, "
+        f"but {n} user(s) have {{ARGON2}} password hashes that would be stored "
+        "verbatim.\nThose writes will fail. Load the module first, e.g.:\n\n"
+        "  dn: cn=module{0},cn=config\n"
+        "  changetype: modify\n"
+        "  add: olcModuleLoad\n"
+        "  olcModuleLoad: argon2\n\n"
+        "Then re-run. Override this check with --skip-argon2-check."
+    )
+
+
+def _warn_argon2_unverified() -> None:
+    console.print(
+        "    [dim]Could not read cn=config to confirm the argon2 module. "
+        "If {ARGON2} writes fail, load pw-argon2 on the target "
+        "(olcModuleLoad: argon2).[/dim]"
+    )
+
+
+def _set_user_password(
+    conn: Connection,
+    dn: str,
+    pw_value: object,
+    reset_password: Optional[str],
+) -> tuple[str, str]:
+    """
+    Apply userPassword via MODIFY_REPLACE on *dn*.
+
+    Pre-hashed values are sent with the Relax control so OpenLDAP's ppolicy
+    skips quality checking and stores the {SSHA}/{CRYPT}/… bytes verbatim;
+    plaintext values are sent without Relax so the server runs olcPasswordHash
+    and stores the resulting hash.
+
+    When ppolicy still rejects (e.g. the bind identity has no Relax authority
+    or the server doesn't honor the control) and ``reset_password`` is set,
+    retries once with that plaintext.
+
+    Returns one of:
+      ("ok",    "")                          — password applied
+      ("ok",    "password unchanged")        — target already held this value
+      ("reset", "applied with reset password")
+      ("reset", "already at reset password")
+      ("error", "...")
+    """
+    pw_list = pw_value if isinstance(pw_value, list) else [pw_value]
+    first = pw_list[0] if pw_list else None
+    controls = [RELAX_RULES_CONTROL] if _password_is_hashed(first) else None
+
+    try:
+        conn.modify(
+            dn,
+            {"userPassword": [(MODIFY_REPLACE, pw_list)]},
+            controls=controls,
+        )
+        if conn.result["result"] == 0:
+            return "ok", ""
+        return "error", conn.result["description"]
+    except LDAPConstraintViolationResult as e:
+        # ppolicy may reject because (a) it doesn't honor Relax for this
+        # bind / value, or (b) the new value equals the stored one
+        # ("not being changed"), which is benign.
+        if "not being changed" in (e.message or "").lower():
+            return "ok", "password unchanged"
+        if not reset_password:
+            return "error", str(e)
+        try:
+            conn.modify(dn, {"userPassword": [(MODIFY_REPLACE, [reset_password])]})
+            if conn.result["result"] == 0:
+                return "reset", "applied with reset password"
+            return "error", f"reset-retry failed: {conn.result['description']}"
+        except LDAPConstraintViolationResult as e2:
+            # Re-imports land here: the target already holds the reset
+            # plaintext, so a MODIFY_REPLACE to the same value trips
+            # "not being changed". That's the state we want — surface it
+            # as a successful reset.
+            if "not being changed" in (e2.message or "").lower():
+                return "reset", "already at reset password"
+            return "error", f"reset-retry failed: {e2}"
+        except LDAPException as e2:
+            return "error", f"reset-retry failed: {e2}"
+    except LDAPException as e:
+        return "error", str(e)
+
+
 # ── import a single user ─────────────────────────────────────────────────────
 
 def import_user(
@@ -519,15 +718,15 @@ def import_user(
     Returns (status, detail) where
     status ∈ {added, updated, reset, skipped, error, dry-run}.
 
-    When reset_password is set and the server rejects userPassword with a
-    constraint violation, the operation is retried once with that plaintext
-    substituted for userPassword. Sending plaintext lets ppolicy run its own
-    quality checks (it rejects pre-hashed values outright under
-    pwdCheckQuality=2) and lets the server hash it via olcPasswordHash.
+    userPassword is always applied via a separate MODIFY_REPLACE (with the
+    Relax control for pre-hashed values, so ppolicy skips quality checking).
+    Splitting it out of the add/bulk-update means a password rejection
+    never blocks entry creation or rolls back other attribute changes —
+    the entry lands first, and any password failure is reported per-user.
 
-    On update, userPassword is applied in a separate modify from the other
-    attributes so a ppolicy rejection (or a "not being changed" no-op) does
-    not atomically roll back the other attribute changes alongside it.
+    When ``reset_password`` is set and ppolicy still rejects the supplied
+    value, the password modify is retried once with that plaintext, which
+    the server hashes via olcPasswordHash.
     """
     if dry_run:
         exists = False
@@ -539,66 +738,46 @@ def import_user(
         action = "would update" if exists else "would add"
         return "dry-run", action
 
-    # ── add ──
+    pw_val = attrs.get("userPassword")
+    attrs_no_pw = {k: v for k, v in attrs.items() if k != "userPassword"}
+
+    # ── add (without userPassword — applied separately below) ──
     try:
-        conn.add(dn, attributes=attrs)
-        if conn.result["result"] == 0:
+        conn.add(dn, attributes=attrs_no_pw)
+        if pw_val is None:
             return "added", ""
-        if conn.result["result"] != 68:   # not entryAlreadyExists
-            return "error", conn.result["description"]
+        pw_status, pw_detail = _set_user_password(conn, dn, pw_val, reset_password)
+        if pw_status == "error":
+            return "error", f"added; password: {pw_detail}"
+        if pw_status == "reset":
+            return "reset", pw_detail
+        return "added", pw_detail
     except LDAPEntryAlreadyExistsResult:
         pass
-    except LDAPConstraintViolationResult as e:
-        if not (reset_password and "userPassword" in attrs):
-            return "error", str(e)
-        # ppolicy rejected the hash — retry add with the plaintext so the
-        # server can hash it via olcPasswordHash. If the retry fails with
-        # entryAlreadyExists, the entry was actually already there: fall
-        # through to the update path carrying the reset password forward.
-        attrs = dict(attrs)
-        attrs["userPassword"] = reset_password
-        try:
-            conn.add(dn, attributes=attrs)
-            if conn.result["result"] == 0:
-                return "reset", "added with reset password"
-            if conn.result["result"] != 68:
-                return "error", f"reset-retry failed: {conn.result['description']}"
-        except LDAPEntryAlreadyExistsResult:
-            pass
-        except LDAPException as e2:
-            return "error", f"reset-retry failed: {e2}"
     except LDAPException as e:
         return "error", str(e)
 
     # ── entry already exists ──
     if skip_existing:
         return "skipped", "already exists"
-
     if not update:
         return "error", "entry already exists (use --update or --skip-existing)"
 
-    # ── update: replace every attribute we have ──
-    # userPassword is applied in its own modify below; keep it out of the
-    # bulk change set so a ppolicy rejection doesn't atomically roll back
-    # the other attribute updates.
-    pw_val = attrs.get("userPassword")
+    # ── update non-password attributes ──
     changes = {
         attr: [(MODIFY_REPLACE, val if isinstance(val, list) else [val])]
-        for attr, val in attrs.items()
-        if attr not in ("objectClass", "userPassword")
+        for attr, val in attrs_no_pw.items()
+        if attr != "objectClass"
     }
-    # objectClass: add missing classes, but don't remove existing ones
+    # objectClass: union with existing, never shrink
     try:
         conn.search(dn, "(objectClass=*)", search_scope=BASE, attributes=["objectClass"])
         existing_oc = set(
-            conn.entries[0].objectClass.values
-            if conn.entries else []
+            conn.entries[0].objectClass.values if conn.entries else []
         )
     except LDAPException:
         existing_oc = set()
-
-    new_oc = set(attrs.get("objectClass", []))
-    combined = list(existing_oc | new_oc)
+    combined = list(existing_oc | set(attrs.get("objectClass", [])))
     changes["objectClass"] = [(MODIFY_REPLACE, combined)]
 
     try:
@@ -608,40 +787,15 @@ def import_user(
     except LDAPException as e:
         return "error", str(e)
 
+    # ── update userPassword ──
     if pw_val is None:
         return "updated", ""
-
-    pw_value = pw_val if isinstance(pw_val, list) else [pw_val]
-    try:
-        conn.modify(dn, {"userPassword": [(MODIFY_REPLACE, pw_value)]})
-        if conn.result["result"] == 0:
-            return "updated", ""
-        return "error", f"password update failed: {conn.result['description']}"
-    except LDAPConstraintViolationResult as e:
-        # First attempt may fail because ppolicy rejects the supplied hash
-        # (pwdCheckQuality=2 refuses pre-hashed values) or because the new
-        # value matches what's already stored ("not being changed").
-        if "not being changed" in (e.message or "").lower():
-            return "updated", "password unchanged"
-        if not reset_password:
-            return "error", f"password update failed: {e}"
-        try:
-            conn.modify(dn, {"userPassword": [(MODIFY_REPLACE, [reset_password])]})
-            if conn.result["result"] == 0:
-                return "reset", "updated with reset password"
-            return "error", f"reset-retry failed: {conn.result['description']}"
-        except LDAPConstraintViolationResult as e2:
-            # Re-imports land here: target already holds the reset
-            # plaintext, so ppolicy refuses a MODIFY_REPLACE that would
-            # leave userPassword unchanged. The account is in the state
-            # we want — surface it as a successful reset.
-            if "not being changed" in (e2.message or "").lower():
-                return "reset", "already at reset password"
-            return "error", f"reset-retry failed: {e2}"
-        except LDAPException as e2:
-            return "error", f"reset-retry failed: {e2}"
-    except LDAPException as e:
-        return "error", f"password update failed: {e}"
+    pw_status, pw_detail = _set_user_password(conn, dn, pw_val, reset_password)
+    if pw_status == "error":
+        return "error", f"password: {pw_detail}"
+    if pw_status == "reset":
+        return "reset", pw_detail
+    return "updated", pw_detail
 
 
 # ── pwdReset (force password change on next login) ───────────────────────────
@@ -651,15 +805,19 @@ def force_password_change(
 ) -> tuple[bool, str]:
     """Set pwdReset=TRUE so the user must change password on next login.
 
-    pwdReset is defined by the OpenLDAP ppolicy schema; the modify fails with
-    'undefined attribute type' if that schema isn't loaded on the target. The
-    user import itself has already succeeded — the caller surfaces the failure
-    in the per-user result column without aborting the run.
+    pwdReset is a ppolicy operational attribute — external writes to it
+    require the Relax control, which we attach. The modify still fails
+    with 'undefined attribute type' if the ppolicy schema isn't loaded
+    on the target; the caller surfaces that per-user without aborting.
     """
     if dry_run:
         return True, "would set pwdReset=TRUE"
     try:
-        conn.modify(dn, {"pwdReset": [(MODIFY_REPLACE, ["TRUE"])]})
+        conn.modify(
+            dn,
+            {"pwdReset": [(MODIFY_REPLACE, ["TRUE"])]},
+            controls=[RELAX_RULES_CONTROL],
+        )
         if conn.result["result"] == 0:
             return True, "pwdReset=TRUE"
         return False, conn.result["description"]
@@ -918,6 +1076,9 @@ def main() -> None:
     console.print()
     console.rule("[bold]Step 2 — Connect to target")
     conn, uri = connect(args)
+
+    # Fail fast if {ARGON2} hashes are present but the module is missing.
+    preflight_argon2(conn, users, args.skip_argon2_check)
 
     # Resolve target base DN
     tgt_base = args.target_base

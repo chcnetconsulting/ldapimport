@@ -1,0 +1,9 @@
+services:
+  openldap:
+    build: .
+    image: ldapimport-openldap-argon2
+    container_name: ldapimport-openldap
+    ports:
+      - "1389:389"   # host 1389 -> container 389; import uses ldap://localhost:1389
+    # Domain: local.test  ->  suffix dc=local,dc=test
+    # Admin : cn=admin,dc=local,dc=test  /  password "admin"
